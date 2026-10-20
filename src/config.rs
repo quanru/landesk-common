@@ -203,6 +203,9 @@ fn ipc_parent_dir_for_uid(uid: u32, postfix: &str) -> String {
     if is_service_ipc_postfix(postfix) {
         format!("/tmp/{app_name}-service")
     } else {
+        if let Some(paths) = crate::app_paths::get() {
+            return format!("/tmp/{app_name}-{uid}-{}", paths.ipc_namespace());
+        }
         format!("/tmp/{app_name}-{uid}")
     }
 }
@@ -845,6 +848,10 @@ impl Config {
     }
 
     pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(paths) = crate::app_paths::get() {
+            return paths.config().join(p);
+        }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let mut path: PathBuf = APP_DIR.read().unwrap().clone().into();
@@ -877,6 +884,10 @@ impl Config {
     /// See [`Self::get_home()`] for security considerations regarding `$HOME` usage.
     #[allow(unreachable_code)]
     pub fn log_path() -> PathBuf {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(paths) = crate::app_paths::get() {
+            return paths.logs();
+        }
         #[cfg(target_os = "macos")]
         {
             if let Some(path) = dirs_next::home_dir().as_mut() {
@@ -914,7 +925,8 @@ impl Config {
             // https://docs.microsoft.com/en-us/windows/win32/ipc/pipe-names
             format!(
                 "\\\\.\\pipe\\{}\\query{}",
-                *APP_NAME.read().unwrap(),
+                crate::app_paths::get().map(|paths| format!("{}-{}", *APP_NAME.read().unwrap(), paths.ipc_namespace()))
+                    .unwrap_or_else(|| APP_NAME.read().unwrap().clone()),
                 postfix
             )
         }
@@ -3003,7 +3015,7 @@ pub fn is_disable_account() -> bool {
 
 #[inline]
 pub fn is_disable_installation() -> bool {
-    is_some_hard_opton("disable-installation")
+    true
 }
 
 // This function must be kept the same as the one in flutter and sciter code.
