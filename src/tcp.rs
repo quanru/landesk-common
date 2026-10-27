@@ -88,14 +88,11 @@ impl FramedStream {
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        // Validate before any DNS resolution or socket creation. No public route,
+        // hostname lookup, rendezvous or fallback is available at this boundary.
         let display = remote_addr.to_string();
-        let addresses: Vec<_> = lookup_host(&remote_addr)
-            .await
-            .map_err(|err| crate::anyhow::anyhow!("DNS resolution failed for {display}: {err}"))?
-            .collect();
-        if addresses.is_empty() {
-            bail!("DNS resolution returned no address for {display}");
-        }
+        let endpoint = crate::lan::Endpoint::parse(&display)?;
+        let addresses = [endpoint.authority().parse::<SocketAddr>()?];
         let mut last_error = "route unavailable".to_owned();
         for remote_addr in addresses {
             let local = if let Some(addr) = local_addr {
@@ -343,5 +340,42 @@ impl Encrypt {
         let mut key = [0u8; secretbox::KEYBYTES];
         key[..].copy_from_slice(&symmetric_key);
         Ok(Key(key))
+    }
+}
+
+#[cfg(test)]
+mod local_only_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn outbound_transport_rejects_public_ips_and_names_before_connecting() {
+        for target in [
+            "8.8.8.8:443",
+            "example.com:443",
+            "123456789",
+            "[::ffff:8.8.8.8]:443",
+        ] {
+            let result = FramedStream::new(target, None, 0).await;
+            let error = match result {
+                Ok(_) => panic!("accepted {target}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("private") || error.contains("LAN"),
+                "{target}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_transport_still_connects_directly_to_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(
+            FramedStream::new(address, None, 1000),
+            crate::timeout(1000, listener.accept())
+        );
+        assert!(client.is_ok());
+        assert!(server.unwrap().unwrap().1.ip().is_loopback());
     }
 }

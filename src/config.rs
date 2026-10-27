@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
@@ -36,11 +35,10 @@ use permanent_password::{
 };
 
 use crate::{
-    compress::{compress, decompress},
     log,
     password_security::{
         decrypt_str_or_original, decrypt_vec_or_original, encrypt_str_or_original,
-        encrypt_vec_or_original, symmetric_crypt,
+        encrypt_vec_or_original,
     },
 };
 
@@ -69,11 +67,18 @@ pub fn is_lan_only_obsolete_option(key: &str) -> bool {
             | "proxy-url"
             | "proxy-username"
             | "proxy-password"
+            | "enable-tcp-punch"
             | "enable-udp-punch"
             | "enable-ipv6-punch"
             | "allow-websocket"
             | "force-always-relay"
             | "access-token"
+            | "access_token"
+            | "enable-webrtc"
+            | "ice-servers"
+            | "allow-hostname-as-id"
+            | "allow-kcp-congestion-control"
+            | "allow-webrtc-congestion-control"
             | "direct-server"
             | "direct-access-port"
             | "access-mode"
@@ -313,32 +318,15 @@ impl std::fmt::Debug for Config {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
-pub struct Socks5Server {
-    #[serde(default, deserialize_with = "deserialize_string")]
-    pub proxy: String,
-    #[serde(default, deserialize_with = "deserialize_string")]
-    pub username: String,
-    #[serde(default, deserialize_with = "deserialize_string")]
-    pub password: String,
-}
-
 // more variable configs
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config2 {
-    #[serde(default, deserialize_with = "deserialize_string")]
-    rendezvous_server: String,
-    #[serde(default, deserialize_with = "deserialize_i32")]
-    nat_type: i32,
     #[serde(default, deserialize_with = "deserialize_i32")]
     serial: i32,
     #[serde(default, deserialize_with = "deserialize_string")]
     unlock_pin: String,
     #[serde(default, deserialize_with = "deserialize_string")]
     trusted_devices: String,
-
-    #[serde(default)]
-    socks: Option<Socks5Server>,
 
     // the other scalar value must before this
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
@@ -585,10 +573,7 @@ impl Config2 {
 
     fn sanitize_lan_only(&mut self) -> bool {
         let before = self.clone();
-        self.rendezvous_server.clear();
-        self.nat_type = 0;
         self.trusted_devices.clear();
-        self.socks = None;
         self.options
             .retain(|key, _| !is_lan_only_obsolete_option(key));
         *self != before
@@ -601,16 +586,6 @@ impl Config2 {
     fn store(&self) {
         let mut config = self.clone();
         let stored = Config::load_::<Config2>("2");
-        if let Some(mut socks) = config.socks {
-            let stored_password = stored
-                .socks
-                .as_ref()
-                .map(|socks| socks.password.as_str())
-                .unwrap_or_default();
-            socks.password =
-                keep_encrypted_storage_if_plaintext_unchanged(&socks.password, stored_password);
-            config.socks = Some(socks);
-        }
         config.unlock_pin =
             keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
         Config::store_(&config, "2");
@@ -696,8 +671,6 @@ impl Config {
 
     fn load() -> Config {
         let mut config = Config::load_::<Config>("");
-        Ab::remove();
-        Group::remove();
         if config.sanitize_lan_only() {
             Config::store_(&config, "");
         }
@@ -1189,15 +1162,6 @@ impl Config {
         } else {
             None
         }
-    }
-
-    pub fn no_register_device() -> bool {
-        BUILTIN_SETTINGS
-            .read()
-            .unwrap()
-            .get(keys::OPTION_REGISTER_DEVICE)
-            .map(|v| v == "N")
-            .unwrap_or(false)
     }
 
     pub fn is_disable_change_permanent_password() -> bool {
@@ -2062,8 +2026,19 @@ impl LocalConfig {
         removed || before != self.recent_lan_endpoints.len()
     }
 
+    fn sanitize_lan_only(&mut self) -> bool {
+        let before = self.options.len();
+        self.options
+            .retain(|key, _| !is_lan_only_obsolete_option(key));
+        before != self.options.len()
+    }
+
     fn load() -> LocalConfig {
-        Config::load_::<LocalConfig>("_local")
+        let mut config = Config::load_::<LocalConfig>("_local");
+        if config.sanitize_lan_only() {
+            config.store();
+        }
+        config
     }
 
     fn store(&self) {
@@ -2168,6 +2143,9 @@ impl LocalConfig {
     }
 
     pub fn get_option(k: &str) -> String {
+        if is_lan_only_obsolete_option(k) {
+            return String::new();
+        }
         get_or(
             &OVERWRITE_LOCAL_SETTINGS,
             &LOCAL_CONFIG.read().unwrap().options,
@@ -2179,6 +2157,9 @@ impl LocalConfig {
 
     // Usually get_option should be used.
     pub fn get_option_from_file(k: &str) -> String {
+        if is_lan_only_obsolete_option(k) {
+            return String::new();
+        }
         get_or(
             &OVERWRITE_LOCAL_SETTINGS,
             &Self::load().options,
@@ -2193,6 +2174,13 @@ impl LocalConfig {
     }
 
     pub fn set_option(k: String, v: String) {
+        if is_lan_only_obsolete_option(&k) {
+            let mut config = LOCAL_CONFIG.write().unwrap();
+            if config.options.remove(&k).is_some() {
+                config.store();
+            }
+            return;
+        }
         if !is_option_can_save(&OVERWRITE_LOCAL_SETTINGS, &k, &DEFAULT_LOCAL_SETTINGS, &v) {
             let mut config = LOCAL_CONFIG.write().unwrap();
             if config.options.remove(&k).is_some() {
@@ -2472,134 +2460,6 @@ impl UserDefaultConfig {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct AbPeer {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub id: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub hash: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub username: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub hostname: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub platform: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub alias: String,
-    #[serde(default, deserialize_with = "deserialize_vec_string")]
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct AbEntry {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub guid: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub name: String,
-    #[serde(default, deserialize_with = "deserialize_vec_abpeer")]
-    pub peers: Vec<AbPeer>,
-    #[serde(default, deserialize_with = "deserialize_vec_string")]
-    pub tags: Vec<String>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub tag_colors: String,
-}
-
-impl AbEntry {
-    pub fn personal(&self) -> bool {
-        self.name == "My address book" || self.name == "Legacy address book"
-    }
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct Ab {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub access_token: String,
-    #[serde(default, deserialize_with = "deserialize_vec_abentry")]
-    pub ab_entries: Vec<AbEntry>,
-}
-
-impl Ab {
-    fn path() -> PathBuf {
-        let filename = format!("{}_ab", APP_NAME.read().unwrap().clone());
-        Config::path(filename)
-    }
-
-    pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
-                log::error!("ab data too large, {} > {}", data.len(), max_len);
-                return;
-            }
-            if let Ok(data) = symmetric_crypt(&data, true) {
-                file.write_all(&data).ok();
-            }
-        };
-    }
-
-    pub fn load() -> Ab {
-        if let Ok(mut file) = std::fs::File::open(Self::path()) {
-            let mut data = vec![];
-            if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
-                    let data = decompress(&data);
-                    if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data)) {
-                        return ab;
-                    }
-                }
-            }
-        };
-        Self::remove();
-        Ab::default()
-    }
-
-    pub fn remove() {
-        std::fs::remove_file(Self::path()).ok();
-    }
-}
-
 // use default value when field type is wrong
 macro_rules! deserialize_default {
     ($func_name:ident, $return_type:ty) => {
@@ -2612,124 +2472,6 @@ macro_rules! deserialize_default {
     };
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct GroupPeer {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub id: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub username: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub hostname: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub platform: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub login_name: String,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct GroupUser {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub name: String,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub display_name: String,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct DeviceGroup {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub name: String,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct Group {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub access_token: String,
-    #[serde(default, deserialize_with = "deserialize_vec_groupuser")]
-    pub users: Vec<GroupUser>,
-    #[serde(default, deserialize_with = "deserialize_vec_grouppeer")]
-    pub peers: Vec<GroupPeer>,
-    #[serde(default, deserialize_with = "deserialize_vec_devicegroup")]
-    pub device_groups: Vec<DeviceGroup>,
-}
-
-impl Group {
-    fn path() -> PathBuf {
-        let filename = format!("{}_group", APP_NAME.read().unwrap().clone());
-        Config::path(filename)
-    }
-
-    pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
-                return;
-            }
-            if let Ok(data) = symmetric_crypt(&data, true) {
-                file.write_all(&data).ok();
-            }
-        };
-    }
-
-    pub fn load() -> Self {
-        if let Ok(mut file) = std::fs::File::open(Self::path()) {
-            let mut data = vec![];
-            if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
-                    let data = decompress(&data);
-                    if let Ok(group) = serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
-                    {
-                        return group;
-                    }
-                }
-            }
-        };
-        Self::remove();
-        Self::default()
-    }
-
-    pub fn remove() {
-        std::fs::remove_file(Self::path()).ok();
-    }
-}
-
 deserialize_default!(deserialize_string, String);
 deserialize_default!(deserialize_bool, bool);
 deserialize_default!(deserialize_i32, i32);
@@ -2740,11 +2482,6 @@ deserialize_default!(deserialize_vec_u8, Vec<u8>);
 deserialize_default!(deserialize_vec_string, Vec<String>);
 deserialize_default!(deserialize_vec_i32_string_i32, Vec<(i32, String, i32)>);
 deserialize_default!(deserialize_vec_discoverypeer, Vec<DiscoveryPeer>);
-deserialize_default!(deserialize_vec_abpeer, Vec<AbPeer>);
-deserialize_default!(deserialize_vec_abentry, Vec<AbEntry>);
-deserialize_default!(deserialize_vec_groupuser, Vec<GroupUser>);
-deserialize_default!(deserialize_vec_grouppeer, Vec<GroupPeer>);
-deserialize_default!(deserialize_vec_devicegroup, Vec<DeviceGroup>);
 deserialize_default!(deserialize_keypair, KeyPair);
 deserialize_default!(deserialize_size, Size);
 deserialize_default!(deserialize_hashmap_string_string, HashMap<String, String>);
@@ -2883,22 +2620,12 @@ pub mod keys {
     pub const OPTION_DIRECT_SERVER: &str = "direct-server";
     pub const OPTION_ALLOW_WEBSOCKET: &str = "allow-websocket";
     pub const OPTION_TRACKPAD_SPEED: &str = "trackpad-speed";
-    pub const OPTION_REGISTER_DEVICE: &str = "register-device";
-    pub const OPTION_RELAY_SERVER: &str = "relay-server";
-    pub const OPTION_ICE_SERVERS: &str = "ice-servers";
+
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
-    pub const OPTION_ALLOW_WEBRTC_CC: &str = "allow-webrtc-congestion-control";
-    pub const OPTION_ALLOW_HOSTNAME_AS_ID: &str = "allow-hostname-as-id";
+
     pub const OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD: &str = "disable-change-permanent-password";
     pub const OPTION_DISABLE_CHANGE_ID: &str = "disable-change-id";
     pub const OPTION_DISABLE_UNLOCK_PIN: &str = "disable-unlock-pin";
-
-    // proxy settings
-    // The following options are not real keys, they are just used for custom client advanced settings.
-    // The real keys are in Config2::socks.
-    pub const OPTION_PROXY_URL: &str = "proxy-url";
-    pub const OPTION_PROXY_USERNAME: &str = "proxy-username";
-    pub const OPTION_PROXY_PASSWORD: &str = "proxy-password";
 }
 
 pub fn common_load<
@@ -3043,12 +2770,69 @@ mod tests {
     }
 
     #[test]
+    fn local_preferences_cannot_restore_cloud_tokens_or_punch_settings() {
+        let mut config = LocalConfig::default();
+        for key in [
+            "access_token",
+            "access-token",
+            "api-server",
+            "enable-tcp-punch",
+            "enable-webrtc",
+        ] {
+            config.options.insert(key.to_owned(), "retired".to_owned());
+        }
+        config
+            .options
+            .insert("language".to_owned(), "zh".to_owned());
+        assert!(config.sanitize_lan_only());
+        assert_eq!(
+            config.options,
+            HashMap::from([("language".to_owned(), "zh".to_owned())])
+        );
+        assert!(!config.sanitize_lan_only());
+    }
+
+    #[test]
+    fn retired_network_fields_are_not_deserialized_or_written() {
+        let mut config: Config2 = toml::from_str(
+            r#"
+rendezvous_server = "public.example"
+nat_type = 2
+[socks]
+proxy = "proxy.example:1080"
+username = "retired"
+password = "retired"
+[options]
+enable-tcp-punch = "Y"
+enable-webrtc = "Y"
+access_token = "retired"
+view_style = "original"
+"#,
+        )
+        .unwrap();
+        config.sanitize_lan_only();
+        let persisted = toml::to_string(&config).unwrap();
+        for retired in [
+            "rendezvous",
+            "nat_type",
+            "socks",
+            "punch",
+            "webrtc",
+            "access_token",
+            "retired",
+        ] {
+            assert!(!persisted.contains(retired), "{retired}: {persisted}");
+        }
+        assert_eq!(
+            config.options.get("view_style").map(String::as_str),
+            Some("original")
+        );
+    }
+
+    #[test]
     fn lan_only_sanitizer_removes_public_network_options() {
         let mut config = Config2 {
-            rendezvous_server: "public.example".to_owned(),
-            nat_type: 2,
             trusted_devices: "legacy".to_owned(),
-            socks: Some(Socks5Server::default()),
             options: HashMap::from([
                 ("relay-server".to_owned(), "relay.example".to_owned()),
                 ("view_style".to_owned(), "original".to_owned()),
@@ -3056,10 +2840,7 @@ mod tests {
             ..Default::default()
         };
         assert!(config.sanitize_lan_only());
-        assert!(config.rendezvous_server.is_empty());
-        assert_eq!(config.nat_type, 0);
         assert!(config.trusted_devices.is_empty());
-        assert!(config.socks.is_none());
         assert!(!config.options.contains_key("relay-server"));
         assert_eq!(
             config.options.get("view_style").map(String::as_str),
@@ -3445,7 +3226,7 @@ layout = "saved"
             decrypt_str_or_original(&cfg.unlock_pin, PASSWORD_ENC_VERSION);
         assert!(decrypted);
         cfg.unlock_pin = unlock_pin;
-        cfg.nat_type = 1;
+        cfg.serial = 1;
 
         cfg.store();
 

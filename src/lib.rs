@@ -419,17 +419,10 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
     #[allow(unused_mut)]
     let mut logger_holder: Option<flexi_logger::LoggerHandle> = None;
     INIT.call_once(|| {
-        // webrtc-rs reports the racing design's normal outcome at warn: cancelling the transport
-        // that lost closes every gathered candidate one line at a time, and trickle means the
-        // agent always checks before it holds a pair. Both read as faults beside a connection
-        // that succeeded. agent_gather keeps its warn level - a STUN server it could not reach
-        // is the one upstream signal that explains a session which never connected.
         #[cfg(debug_assertions)]
         {
             use env_logger::*;
-            init_from_env(
-                Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn"),
-            );
+            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,rustls=warn"));
         }
         #[cfg(not(debug_assertions))]
         {
@@ -444,7 +437,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 path.push(_name);
             }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn") {
+            if let Ok(x) = Logger::try_with_env_or_str("debug,rustls=warn") {
                 logger_holder = x
                     .log_to_file(FileSpec::default().directory(path))
                     .write_mode(if _is_async {

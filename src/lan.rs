@@ -1,4 +1,4 @@
-use std::{fmt, net::IpAddr, str::FromStr};
+use std::{convert::TryFrom, fmt, net::IpAddr, str::FromStr};
 
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
@@ -143,6 +143,26 @@ fn validate_host(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// A tunnel may reach a local service, never become a public-network proxy.
+pub fn port_forward_endpoint(host: &str, port: i32) -> Result<std::net::SocketAddr> {
+    let host = if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1"
+    } else {
+        host
+    };
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| anyhow!("Port forwarding requires a private IP address"))?;
+    if !allowed_ip(ip) {
+        bail!("Port forwarding only accepts LAN or private VPN addresses");
+    }
+    let port = u16::try_from(port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| anyhow!("Invalid port forwarding port"))?;
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
 pub fn validate_username(value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -175,6 +195,38 @@ pub fn validate_password(password: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_forwarding_cannot_escape_private_networks() {
+        for host in [
+            "8.8.8.8",
+            "example.com",
+            "::ffff:8.8.8.8",
+            "2001:4860:4860::8888",
+            "0.0.0.0",
+        ] {
+            assert!(port_forward_endpoint(host, 443).is_err(), "{host}");
+        }
+        for port in [-1, 0, 65536] {
+            assert!(port_forward_endpoint("127.0.0.1", port).is_err());
+        }
+        assert_eq!(
+            port_forward_endpoint("localhost", 3389)
+                .unwrap()
+                .to_string(),
+            "127.0.0.1:3389"
+        );
+        assert_eq!(
+            port_forward_endpoint("100.66.69.79", 21118)
+                .unwrap()
+                .to_string(),
+            "100.66.69.79:21118"
+        );
+        assert_eq!(
+            port_forward_endpoint("fd00::1", 22).unwrap().to_string(),
+            "[fd00::1]:22"
+        );
+    }
 
     #[test]
     fn parses_supported_endpoint_forms() {
