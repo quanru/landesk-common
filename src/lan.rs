@@ -114,27 +114,31 @@ fn parse_port(value: &str) -> Result<u16> {
     Ok(port)
 }
 
-fn validate_host(host: &str) -> Result<()> {
-    if host.is_empty() || host.len() > MAX_HOST_LEN {
-        bail!("Invalid endpoint host length");
-    }
-    if IpAddr::from_str(host).is_ok() {
-        return Ok(());
-    }
-    if host.ends_with('.') || host.starts_with('.') {
-        bail!("Invalid domain name");
-    }
-    for label in host.split('.') {
-        if label.is_empty()
-            || label.len() > 63
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            bail!("Invalid domain name");
+pub fn allowed_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || (a == 100 && (64..=127).contains(&b))
         }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return allowed_ip(IpAddr::V4(v4));
+            }
+            let first = ip.segments()[0];
+            ip.is_loopback() || (first & 0xfe00 == 0xfc00) || (first & 0xffc0 == 0xfe80)
+        }
+    }
+}
+
+fn validate_host(host: &str) -> Result<()> {
+    let ip = IpAddr::from_str(host).map_err(|_| {
+        anyhow!("LocalDesk requires a private IP address; IDs and hostnames are disabled")
+    })?;
+    if !allowed_ip(ip) {
+        bail!("LocalDesk only accepts LAN or private VPN IP addresses");
     }
     Ok(())
 }
@@ -179,8 +183,8 @@ mod tests {
             DEFAULT_PORT
         );
         assert_eq!(
-            Endpoint::parse("host.lan:22000").unwrap().host(),
-            "host.lan"
+            Endpoint::parse("100.64.0.10:22000").unwrap().host(),
+            "100.64.0.10"
         );
         assert_eq!(
             Endpoint::parse("[fd00::20]:21118").unwrap().authority(),
@@ -198,8 +202,51 @@ mod tests {
             "host.lan:65536",
             "[fd00::20:21118",
             "bad_label.lan",
+            "host.lan:21118",
+            "123456789",
+            "8.8.8.8",
+            "[::ffff:8.8.8.8]:21118",
+            "0.0.0.0",
+            "192.168.1.20/r",
         ] {
             assert!(Endpoint::parse(input).is_err(), "accepted {:?}", input);
+        }
+    }
+
+    #[test]
+    fn private_address_boundaries() {
+        for ip in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "::1",
+            "fc00::1",
+            "fdff::1",
+            "fe80::1",
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(allowed_ip(ip.parse().unwrap()), "rejected {ip}");
+        }
+        for ip in [
+            "0.0.0.0",
+            "8.8.8.8",
+            "172.15.255.255",
+            "172.32.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "ff02::1",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(!allowed_ip(ip.parse().unwrap()), "accepted {ip}");
         }
     }
 
